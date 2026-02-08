@@ -79,6 +79,8 @@ export default function EmergencyPage() {
   const [state, setState] = useState<ConversationState>('idle')
   const [waveformBars, setWaveformBars] = useState<number[]>(Array(20).fill(0.2))
   const animationRef = useRef<number | null>(null)
+  const audioUnlockedRef = useRef(false)
+  const pendingGreetingRef = useRef<string | null>(null)
   
   // Camera state
   const [cameraEnabled, setCameraEnabled] = useState(false)
@@ -492,6 +494,140 @@ export default function EmergencyPage() {
     }
   }, [])
 
+  // Unlock audio on first user interaction (required by mobile browsers)
+  useEffect(() => {
+    const unlockAudio = () => {
+      if (audioUnlockedRef.current) return
+      const audio = audioRef.current
+      if (audio) {
+        // Play a silent buffer to unlock audio context
+        audio.src = 'data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAABhgC7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7//////////////////////////////////////////////////////////////////8AAAAATGF2YzU4LjEzAAAAAAAAAAAAAAAAJAAAAAAAAAABhkVKakoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/+xBEAAAFEAF/tAAAAoAAL/AAAARAAAAB/AAAACAAADSAAAAEAAAAAAAAAnAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//sQRAWAAAADSAAAAAAAAANIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+        audio.volume = 0.01
+        const playPromise = audio.play()
+        if (playPromise) {
+          playPromise.then(() => {
+            audio.pause()
+            audio.currentTime = 0
+            audio.volume = 1
+            audioUnlockedRef.current = true
+            console.log('Audio unlocked successfully')
+            // Play pending greeting if any
+            if (pendingGreetingRef.current) {
+              const greeting = pendingGreetingRef.current
+              pendingGreetingRef.current = null
+              speakText(greeting)
+            }
+          }).catch(() => {
+            audio.volume = 1
+            console.log('Audio unlock deferred — will retry on next interaction')
+          })
+        }
+      }
+    }
+
+    // Try to unlock on any user gesture
+    const events = ['touchstart', 'touchend', 'click', 'mousedown', 'keydown']
+    events.forEach(e => document.addEventListener(e, unlockAudio, { once: false, passive: true }))
+
+    return () => {
+      events.forEach(e => document.removeEventListener(e, unlockAudio))
+    }
+  }, [])
+
+  // Browser TTS fallback
+  const speakWithBrowserTTS = useCallback((text: string) => {
+    if (typeof window === 'undefined' || !window.speechSynthesis) {
+      setState('idle')
+      return
+    }
+    try {
+      window.speechSynthesis.cancel()
+      const utterance = new SpeechSynthesisUtterance(text)
+      utterance.rate = 1.0
+      utterance.pitch = 1.0
+      utterance.volume = 1.0
+
+      // Try to pick a voice matching the language
+      const langCode = languageRef.current
+      const voices = window.speechSynthesis.getVoices()
+      const langVoice = voices.find(v => v.lang.startsWith(langCode))
+      if (langVoice) utterance.voice = langVoice
+
+      utterance.onend = () => setState('idle')
+      utterance.onerror = () => setState('idle')
+      window.speechSynthesis.speak(utterance)
+    } catch {
+      setState('idle')
+    }
+  }, [])
+
+  // TTS with ElevenLabs (multilingual) + fallback to browser TTS
+  const speakText = useCallback(async (text: string) => {
+    setState('speaking')
+    try {
+      const response = await fetch('/api/text-to-speech', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, language: languageRef.current }),
+      })
+
+      if (response.ok) {
+        const audioBlob = await response.blob()
+        
+        // Verify we got actual audio data
+        if (audioBlob.size < 100) {
+          console.warn('TTS returned tiny response, falling back to browser TTS')
+          speakWithBrowserTTS(text)
+          return
+        }
+
+        const audioUrl = URL.createObjectURL(audioBlob)
+        
+        if (audioRef.current) {
+          audioRef.current.src = audioUrl
+          audioRef.current.onended = () => {
+            setState('idle')
+            URL.revokeObjectURL(audioUrl)
+          }
+          audioRef.current.onerror = () => {
+            console.warn('Audio element error, falling back to browser TTS')
+            URL.revokeObjectURL(audioUrl)
+            speakWithBrowserTTS(text)
+          }
+          try {
+            await audioRef.current.play()
+          } catch (playError) {
+            console.warn('Audio play blocked:', playError)
+            URL.revokeObjectURL(audioUrl)
+            // Fallback to browser TTS which is more likely to work
+            speakWithBrowserTTS(text)
+          }
+        } else {
+          URL.revokeObjectURL(audioUrl)
+          speakWithBrowserTTS(text)
+        }
+      } else {
+        console.warn('TTS API returned', response.status, '— falling back to browser TTS')
+        speakWithBrowserTTS(text)
+      }
+    } catch (error) {
+      console.error('TTS error:', error)
+      speakWithBrowserTTS(text)
+    }
+  }, [speakWithBrowserTTS])
+
+  const stopSpeaking = useCallback(() => {
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current.currentTime = 0
+    }
+    // Also stop browser TTS if running
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      window.speechSynthesis.cancel()
+    }
+    setState('idle')
+  }, [])
+
   // Initialize
   useEffect(() => {
     if (!initializedRef.current) {
@@ -504,49 +640,15 @@ export default function EmergencyPage() {
       setTimeout(() => {
         const greeting = LANGUAGE_GREETINGS[languageRef.current] || LANGUAGE_GREETINGS['en']
         addMessage('ai', greeting)
-        speakText(greeting)
+        // If audio is already unlocked (desktop), speak now;
+        // Otherwise store it and it'll play on first user touch
+        if (audioUnlockedRef.current) {
+          speakText(greeting)
+        } else {
+          pendingGreetingRef.current = greeting
+        }
       }, 600)
     }
-  }, [])
-
-  // TTS with ElevenLabs (multilingual)
-  const speakText = async (text: string) => {
-    setState('speaking')
-    try {
-      const response = await fetch('/api/text-to-speech', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, language: languageRef.current }),
-      })
-
-      if (response.ok) {
-        const audioBlob = await response.blob()
-        const audioUrl = URL.createObjectURL(audioBlob)
-        
-        if (audioRef.current) {
-          audioRef.current.src = audioUrl
-          audioRef.current.onended = () => {
-            setState('idle')
-            URL.revokeObjectURL(audioUrl)
-          }
-          audioRef.current.onerror = () => setState('idle')
-          await audioRef.current.play()
-        }
-      } else {
-        setState('idle')
-      }
-    } catch (error) {
-      console.error('TTS error:', error)
-      setState('idle')
-    }
-  }
-
-  const stopSpeaking = useCallback(() => {
-    if (audioRef.current) {
-      audioRef.current.pause()
-      audioRef.current.currentTime = 0
-    }
-    setState('idle')
   }, [])
 
   // Recording
@@ -812,7 +914,7 @@ export default function EmergencyPage() {
 
   return (
     <div className="h-[100dvh] bg-gradient-to-br from-slate-50 via-white to-indigo-50/30 text-slate-900 flex overflow-hidden" onClick={handleSOSTap}>
-      <audio ref={audioRef} />
+      <audio ref={audioRef} playsInline preload="none" />
       <canvas ref={canvasRef} className="hidden" />
 
       {/* SOS Countdown Overlay */}
